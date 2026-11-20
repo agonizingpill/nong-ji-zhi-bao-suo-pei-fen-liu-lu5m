@@ -10,7 +10,7 @@ def return_view(s,x):
 def dispatch(s,d,u):
     c=s.scalar(select(Claim).where(Claim.id==d.claim_id).with_for_update())
     if not c:raise HTTPException(404,'索赔不存在')
-    if c.historical or c.status not in ['assessed','paid','denied']:raise HTTPException(409,'仅已分流且非历史索赔可登记返厂')
+    if c.historical or c.status not in ['assessed','manual','paid','denied']:raise HTTPException(409,'仅已分流（或转人工）且非历史索赔可登记返厂')
     if not s.scalar(select(Inspection.id).where(Inspection.claim_id==c.id)):raise HTTPException(409,'请先保存拆检意见，再安排旧件返厂')
     if s.scalar(select(PartReturn.id).where(PartReturn.claim_id==c.id)):raise HTTPException(409,'该索赔已有返厂单，不得重复发件')
     m=s.get(Machine,c.machine_id)

@@ -28,17 +28,17 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 1. 机具台账：序列号唯一，累计工时不可倒退。
 2. 索赔受理：关联真实机具，故障工时不得低于台账；超质保工时直接标记过保，不能赔付。
-3. 风险分流：Redis 队列交给 Python worker 计算，写回风险概率与模型证据；失败可重试。
-4. 拆检裁决：评估员补拆检意见；概率 ≥0.5 的高风险索赔必须证据完整才能赔付；主管裁决同时更新 Claim.status 和 Inspection.decision，结案不可再改。
+3. 风险分流：主管按部件设定漏判率与完整拆检率上限；训练、选线、验线使用三份互不重叠样本（60%/20%/20%，按部件×争议标签分层，seed=42）。只有两项指标在选线与验线上都达标的线才可采用；否则该单转人工。概率、分流线与拆检要求一起写回，签赔按该次要求放行。失败可沿用原分流线与受理时限额重试，不更换样本或分流线。
+4. 拆检裁决：评估员补拆检意见；该次分流要求完整拆检的索赔（概率≥该线阈值，或部件漏判上限为零）必须证据完整才能赔付；主管裁决同时更新 Claim.status 和 Inspection.decision，结案不可再改。转人工的索赔同样须补齐证据后才能签赔。
 
 5. 旧件返厂：索赔完成分流并有拆检意见后登记物流；每份索赔仅一单，实收序列必须匹配发件快照；收货证据不得覆盖，主管核验后冻结。
 6. 赔付结算：仅已赔付且旧件核验通过的现场索赔可生成费用核定单；Python Decimal 按配件费＋工时×费率计算金额上限；主管核定不得超额，核定后冻结金额，使用唯一记账凭证一次入账。
 
-历史数据为固定 seed=42 生成的 180 条**模拟**已结案索赔，只用于演示。ColumnTransformer 对机型和故障部位 One-hot 编码，对故障工时、机龄、渗漏数值标准化，LogisticRegression 分类；分层留出 25%（45条），训练集 135 条，报告留出 accuracy/ROC AUC 及编码后系数。输入来自领域表而非任意 JSON。数据不足40条拒绝训练；不把模型输出作为自动赔付依据。随机种子42、训练/留出划分固定，模型的概率是模拟数据上的演示估计，未作真实业务校准。
+历史数据为固定 seed=42 生成的 180 条**模拟**已结案索赔，只用于演示。ColumnTransformer 对机型和故障部位 One-hot 编码，对故障工时、机龄、渗漏数值标准化，LogisticRegression 分类；按部件×争议标签分层切成训练 108 / 选线 36 / 验线 36 三份互不重叠样本。阈值在选线样本上按“离各部件两项上限余量最大”选取，再用验线样本独立复核；采用与否取决于两套样本上每个部件的漏判率与完整拆检率是否都达标。模型的概率是模拟数据上的演示估计，未作真实业务校准；验线 accuracy/ROC AUC 仅作描述性审阅。输入来自领域表而非任意 JSON；数据不足40条或分层后某部件样本缺失时拒绝训练。不把模型输出作为自动赔付依据。
 
 ### 一天的工作剧本
 
-08:30 评估员查 GC-2408 水田机，台账 860h、质保2000h；09:00 受理 `CL-26017` 液压渗漏、机龄400天；09:30 分流 `CL-HIGH`（1900h/680天）；10:00 查看训练135/留出45条和风险概率；10:30 仅补文字但不勾证据，主管赔付被拒；11:00 核对工时计、油样和照片后补全证据；14:00 主管签署，索赔和拆检同步为 paid；16:00 查看审计，同时确认 `CL-EXPIRED` 的2450h过保不能赔付。真实验收会另建 `GC-E2E` 与 `CL-E2E` 检查新记录链路。
+08:30 评估员查 GC-2408 水田机，台账 860h、质保2000h；09:00 受理 `CL-26017` 液压渗漏、机龄400天；09:30 分流 `CL-HIGH`（1900h/680天）；10:00 查看训练108/选线36/验线36条、限额 v1（液压漏判≤15%）和风险概率；10:30 仅补文字但不勾证据，主管赔付被拒；11:00 核对工时计、油样和照片后补全证据；14:00 主管签署，索赔和拆检同步为 paid；16:00 查看审计，同时确认 `CL-EXPIRED` 的2450h过保不能赔付。把液压漏判上限调到 1% 后，原分流线在验线上不再达标，自动停用，新单转人工；已评分索赔仍按受理时限额版本放行。真实验收会另建 `GC-E2E` 与 `CL-E2E` 检查新记录链路。
 
 ## 技术和目录
 
@@ -51,13 +51,26 @@ docker compose exec -T backend python -m scripts.seed_demo
 |队列|Redis7 list；共享 artifacts 卷保存模型指标与心跳|
 |安全横切|JWT8小时、角色校验、PBKDF2口令、审计、请求追踪、全局错误恢复|
 
-`backend/src/models.py` 领域实体；`schemas.py` 请求约束；`claim_service.py` 状态与关联规则；`risk_model.py` 算法；`worker.py` 队列；`main.py` 路由；`middlewares.py` 请求追踪和错误恢复。`backend/scripts/seed_demo.py` 仅插入自然键缺失的演示记录，不覆盖修改。`frontend/src/pages/` 九业务页；`components/common.js` 共享导航、状态、标题和通知；`utils/api.js` API/会话/页面状态；`utils/format.js` 转义和格式化。
+`backend/src/models.py` 领域实体；`schemas.py` 请求约束；`claim_service.py` 状态与关联规则；`triage_models.py` 限额版本/分流线/单笔分流快照；`risk_model.py` 三样本划分、阈值选择与复核算法；`triage_service.py` 限额变更、训练、采用与评分快照；`triage_routes.py` 分流接口；`worker.py` 队列；`main.py` 路由；`middlewares.py` 请求追踪和错误恢复。`backend/scripts/seed_demo.py` 仅插入自然键缺失的演示记录，不覆盖修改。`frontend/src/pages/` 九业务页；`components/common.js` 共享导航、状态、标题和通知；`utils/api.js` API/会话/页面状态；`utils/format.js` 转义和格式化。
 
 角色、索赔状态、故障部位枚举分别在 `backend/src/constants.py` 与 `frontend/src/constants.js` 定义；请求部位在 `backend/src/schemas.py` 的 Literal 中约束；角色校验在 `security.py`/`main.py`，状态转换在 `claim_service.py`/`worker.py`。共用状态徽标在索赔/风险/拆检三页复用。
 
 环境变量 `.env.example`：COMPOSE_PROJECT_NAME、FRONTEND_PORT、BACKEND_PORT、DB_PORT、JWT_SECRET；数据库连接和 Redis 地址在 Compose 内设置。命名卷 db-data、redis-data、artifacts。当前宿主默认网络池耗尽，因此显式使用10.221.22.0/24子网；若换环境冲突可修改Compose networks。五服务都有真实健康检查，backend/worker 等待 MySQL/Redis healthy，前端等待后端。默认 seed 失败记日志不阻止进程。生产前应替换演示口令和 JWT secret。
 
 本地开发：Python `pip install -r backend/requirements.txt`，设置 DATABASE_URL/REDIS_URL 后在 backend 下 `uvicorn src.main:app --reload`；前端仍由 Compose Nginx 代理。测试与截图都在仓库外层 `test-artifacts/gb-1022/`，不会混入源码。
+
+## 分部件拆检限额与分流线
+
+主管在风险分页按部件设置漏判率与完整拆检率上限，每次保存生成新版本，旧版本与已评分索赔的快照保持不变。分流线必须在训练（108）/选线（36）/验线（36）三份互不重叠样本上逐部件达标才可**采用**；未达标或已停用的线不参与新单评分，该单直接转人工（`Claim.status=manual`）。受理（`POST /claims`）时就固定限额版本（工时过保的索赔在受理时即标记 `out_of_warranty`，不进入分流）；首次评分再固定分流线、阈值与样本划分；`/assess/retry` 只重新排队，不改换样本、分流线或限额版本。概率 ≥ 阈值或部件漏判上限为零时要求完整拆检；拆检要求随该单快照保存，签赔时据此校验证据，转人工单也必须补齐证据。
+
+|接口|权限与用途|
+|---|---|
+|GET /triage-limits、GET /triage-models、GET /triage-records、GET /claims/{id}/triage|三角色读取限额版本、分流线与每单依据（含首次评分时固定的样本编号）|
+|POST /triage-limits|admin 设定新限额版本；收紧后不再达标的已采用线自动停用|
+|POST /triage-models、/{id}/activate、/{id}/deactivate|admin 训练、采用、停用分流线；未达标的线不能采用|
+|POST /claims/{id}/assess、/assess/retry|admin/assessor 首次分流固定依据；重试沿用原线与原限额|
+
+风险分页（`frontend/src/pages/risk.js`）含限额表单、分流线版本与选线/验线指标表、以及“本单依据”面板（概率、阈值、限额版本、样本编号与拆检要求）。`seed_demo.py` 在首次启动时建立限额 v1 并训练、采用一条达标的演示线；之后重复 seed 不覆盖。
 
 ## 新增履约模块
 

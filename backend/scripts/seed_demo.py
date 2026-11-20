@@ -8,6 +8,8 @@ from src.settlement_models import Settlement
 from src.repair_models import RepairBay,RepairAppointment
 from src.spare_models import SpareStock,PartIssue
 from src.followup_models import RepairFollowup
+from src.triage_models import TriageLimit,TriageModel,ClaimTriage
+from src import triage_service as triage
 
 def seed():
     Base.metadata.create_all(engine)
@@ -42,6 +44,12 @@ def seed():
             if not s.scalar(select(RepairBay).where(RepairBay.code==code)):s.add(RepairBay(code=code,daily_hours=cap,active=active))
         for code,part,qty in [('SP-HYD-01','hydraulic',20),('SP-ENG-01','engine',5),('SP-TRANS-01','transmission',3)]:
             if not s.scalar(select(SpareStock).where(SpareStock.code==code)):s.add(SpareStock(code=code,part=part,available_qty=qty))
+    with Session.begin() as s:
+        triage.ensure_default_limit(s)
+        for c in s.scalars(select(Claim).where(Claim.historical==False,Claim.status=='submitted')).all():triage.record_intake(s,c)
+        if not s.scalar(select(TriageModel.id)):
+            row=triage.train(s,{'email':'system@gengchuan.local','role':'admin'})
+            if row['adopted']:triage.activate(s,row['id'],{'email':'system@gengchuan.local','role':'admin'})
     with Session() as s:
-        print(json.dumps({k:s.scalar(select(func.count()).select_from(v)) for k,v in [('users',User),('machines',Machine),('claims',Claim),('inspections',Inspection),('part_returns',PartReturn),('settlements',Settlement),('repair_bays',RepairBay),('repair_appointments',RepairAppointment),('spare_stocks',SpareStock),('part_issues',PartIssue),('repair_followups',RepairFollowup)]}))
+        print(json.dumps({k:s.scalar(select(func.count()).select_from(v)) for k,v in [('users',User),('machines',Machine),('claims',Claim),('inspections',Inspection),('part_returns',PartReturn),('settlements',Settlement),('repair_bays',RepairBay),('repair_appointments',RepairAppointment),('spare_stocks',SpareStock),('part_issues',PartIssue),('repair_followups',RepairFollowup),('triage_limits',TriageLimit),('triage_models',TriageModel),('claim_triage',ClaimTriage)]}))
 if __name__=='__main__':seed()

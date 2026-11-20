@@ -10,24 +10,36 @@ def get(s,model,id):
     return x
 def audit(s,u,action,detail):s.add(Audit(actor=u['email'],action=action,detail=str(detail),at=datetime.now(timezone.utc).isoformat()))
 def claim_view(s,c):
+    from .triage_models import ClaimTriage
+    from . import triage_service as triage
     d=obj(c);d['machine_serial']=s.get(Machine,c.machine_id).serial
     i=s.scalar(select(Inspection).where(Inspection.claim_id==c.id));d['inspection']=obj(i) if i else None
+    t=s.scalar(select(ClaimTriage).where(ClaimTriage.claim_id==c.id))
+    d['triage']=triage.triage_view(s,t) if t else None
+    d['requirements']=triage.claim_requirements(s,c)
     return d
 def submit(s,data,u):
     m=get(s,Machine,data.machine_id)
     if data.hours_at_failure<m.hours:raise HTTPException(409,'故障工时不能小于机具最新台账工时')
     c=Claim(**data.model_dump(),historical=False,status='out_of_warranty' if data.hours_at_failure>m.warranty_hours else 'submitted',assessment_note='超出质保工时' if data.hours_at_failure>m.warranty_hours else '')
-    m.hours=data.hours_at_failure;s.add(c);s.flush();audit(s,u,'claim_received',c.code);return claim_view(s,c)
+    m.hours=data.hours_at_failure;s.add(c);s.flush()
+    from . import triage_service as triage
+    triage.record_intake(s,c)
+    if c.status=='out_of_warranty':triage.mark_expired(s,c)
+    audit(s,u,'claim_received',c.code);return claim_view(s,c)
 def inspect(s,c,data,u):
-    if c.status!='assessed':raise HTTPException(409,'仅完成风险分流的索赔可补拆检')
+    if c.status not in ['assessed','manual']:raise HTTPException(409,'仅完成风险分流（或转人工）的索赔可补拆检')
     i=s.scalar(select(Inspection).where(Inspection.claim_id==c.id))
     if not i:i=Inspection(claim_id=c.id,decision='pending',**data.model_dump());s.add(i)
     else:i.findings=data.findings;i.evidence_complete=data.evidence_complete
     audit(s,u,'inspection_updated',c.code);s.flush();return obj(i)
 def adjudicate(s,c,decision,u):
+    from . import triage_service as triage
     if c.status=='out_of_warranty':raise HTTPException(409,'机具故障工时已过保，不允许质保赔付')
-    if c.status!='assessed':raise HTTPException(409,'索赔须完成风险分流，且不可重复裁决')
+    if c.status not in ['assessed','manual']:raise HTTPException(409,'索赔须完成风险分流或转人工，且不可重复裁决')
     i=s.scalar(select(Inspection).where(Inspection.claim_id==c.id))
     if not i:raise HTTPException(409,'必须先记录拆检意见')
-    if decision=='paid' and c.risk is not None and c.risk>=.5 and not i.evidence_complete:raise HTTPException(409,'高争议风险索赔必须补齐拆检证据后才能赔付')
-    c.status=decision;i.decision=decision;audit(s,u,'claim_adjudicated',f'{c.code}:{decision}');return claim_view(s,c)
+    requirements=triage.claim_requirements(s,c)
+    if decision=='paid' and requirements.get('evidence_required') and not i.evidence_complete:
+        raise HTTPException(409,f"该次分流要求补齐拆检证据后才能赔付：{requirements.get('reason','')}")
+    c.status=decision;i.decision=decision;audit(s,u,'claim_adjudicated',f'{c.code}:{decision}:{"evidence" if i.evidence_complete else "no-evidence"}');return claim_view(s,c)
